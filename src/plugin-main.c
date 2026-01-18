@@ -262,12 +262,12 @@ static void dualcam_video_tick(void *data, float seconds)
 	if (!context->manual_mode) {
 		// TODO: Check face detection state and switch cameras
 		// For now, just alternate every 5 seconds for testing
-		// static float time_elapsed = 0;
-		// time_elapsed += seconds;
-		// if (time_elapsed > 5.0f) {
-		//     context->active_camera = (context->active_camera == 1) ? 2 : 1;
-		//     time_elapsed = 0;
-		// }
+		static float time_elapsed = 0;
+		time_elapsed += seconds;
+		if (time_elapsed > 5.0f) {
+		    context->active_camera = (context->active_camera == 1) ? 2 : 1;
+		    time_elapsed = 0;
+		}
 	}
 }
 
