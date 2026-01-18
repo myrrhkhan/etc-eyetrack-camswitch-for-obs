@@ -50,11 +50,13 @@ struct dualcam_switcher {
 	pthread_mutex_t state_mutex;
 
     // ADD: Frame buffers for thread processing
-    Mat cam1_frame;
-    Mat cam2_frame;
-    bool frames_ready;
-    pthread_mutex_t frame_mutex;
-
+	// Double buffering for thread safety
+	Mat cam1_frame_current;
+	Mat cam2_frame_current;
+	Mat cam1_frame_next;
+	Mat cam2_frame_next;
+	bool frames_ready;
+	pthread_mutex_t frame_mutex;
 	int frame_capture_counter;
 };
 
@@ -192,16 +194,18 @@ static void *face_detection_thread(void *data)
         if (context->frames_ready) {
             blog(LOG_INFO, "[DualCam] Processing buffered frames...");
             
-            Mat cam1_copy = context->cam1_frame.clone();
-            Mat cam2_copy = context->cam2_frame.clone();
+            // SWAP the buffers - now "current" has the new frames
+            // and "next" has the old frames (which we don't care about)
+            std::swap(context->cam1_frame_current, context->cam1_frame_next);
+            std::swap(context->cam2_frame_current, context->cam2_frame_next);
             context->frames_ready = false;
             
             pthread_mutex_unlock(&context->frame_mutex);
             
-            // Process outside the lock
+            // Process outside the lock - we own "current" buffers now
             pthread_mutex_lock(&context->state_mutex);
-            process_camera_mat(cam1_copy, context->eye_cascade, &context->cam1state);
-            process_camera_mat(cam2_copy, context->eye_cascade, &context->cam2state);
+            process_camera_mat(context->cam1_frame_current, context->eye_cascade, &context->cam1state);
+            process_camera_mat(context->cam2_frame_current, context->eye_cascade, &context->cam2state);
             pthread_mutex_unlock(&context->state_mutex);
             
             blog(LOG_INFO, "[DualCam] Cam1 has_eyes=%d, Cam2 has_eyes=%d", 
@@ -210,7 +214,7 @@ static void *face_detection_thread(void *data)
             pthread_mutex_unlock(&context->frame_mutex);
         }
         
-        os_sleep_ms(100);  // Check for new frames 10 times per second
+        os_sleep_ms(100);
     }
     
     blog(LOG_INFO, "[DualCam] Detection thread stopped");
@@ -580,7 +584,6 @@ static void dualcam_video_render(void *data, gs_effect_t *effect)
 		return;
 	}
 	
-	// prevent circular reference
 	if (active_source == context->context) {
 		blog(LOG_ERROR, "Cannot render self - circular reference detected!");
 		return;
@@ -594,26 +597,27 @@ static void dualcam_video_render(void *data, gs_effect_t *effect)
 	// Render the active camera's output FIRST
 	obs_source_video_render(active_source);
 	
-	// THEN capture frames for detection (in graphics context!)
+	// THEN capture frames for detection
 	if (!context->manual_mode) {
 		static int frame_count = 0;
-		if (++frame_count % 10 == 0) {  // Every 10 frames
-			Mat cam1_frame = obs_source_to_mat(context->camera1);
-			Mat cam2_frame = obs_source_to_mat(context->camera2);
+		if (++frame_count % 10 == 0) {
+			pthread_mutex_lock(&context->frame_mutex);
 			
-			if (!cam1_frame.empty() || !cam2_frame.empty()) {
-				pthread_mutex_lock(&context->frame_mutex);
-				// CRITICAL: Use .clone() to create deep copies
-				// This ensures thread safety - the detection thread
-				// gets its own copy of the data, not a shared reference
-				context->cam1_frame = cam1_frame.clone();
-				context->cam2_frame = cam2_frame.clone();
-				context->frames_ready = true;
-				pthread_mutex_unlock(&context->frame_mutex);
+			// Skip if detection thread is still processing
+			if (!context->frames_ready) {
+				// Write directly to "next" buffers (no clone needed!)
+				context->cam1_frame_next = obs_source_to_mat(context->camera1);
+				context->cam2_frame_next = obs_source_to_mat(context->camera2);
 				
-				blog(LOG_INFO, "[DualCam] Frames captured: cam1=%dx%d cam2=%dx%d", 
-					 cam1_frame.cols, cam1_frame.rows, cam2_frame.cols, cam2_frame.rows);
+				if (!context->cam1_frame_next.empty() || !context->cam2_frame_next.empty()) {
+					context->frames_ready = true;
+					blog(LOG_INFO, "[DualCam] Frames captured: cam1=%dx%d cam2=%dx%d", 
+						 context->cam1_frame_next.cols, context->cam1_frame_next.rows,
+						 context->cam2_frame_next.cols, context->cam2_frame_next.rows);
+				}
 			}
+			
+			pthread_mutex_unlock(&context->frame_mutex);
 		}
 	}
 }
