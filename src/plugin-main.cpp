@@ -54,6 +54,8 @@ struct dualcam_switcher {
     Mat cam2_frame;
     bool frames_ready;
     pthread_mutex_t frame_mutex;
+
+	int frame_capture_counter;
 };
 
 // --- HELPER FUNCTIONS ---
@@ -417,6 +419,9 @@ static void *dualcam_create(obs_data_t *settings, obs_source_t *source)
 
 	pthread_mutex_init(&context->frame_mutex, NULL);
 	context->frames_ready = false;
+
+	context->frame_capture_counter = 0;
+
     
     blog(LOG_INFO, "DualCam switcher created");
     
@@ -536,33 +541,7 @@ static void dualcam_video_tick(void *data, float seconds)
     
     if (context->manual_mode) return;
     
-    // Capture frames from both cameras
-    static int tick_count = 0;
-    if (++tick_count % 10 == 0) {  // Every 10 frames
-        blog(LOG_INFO, "[DualCam] video_tick: capturing frames...");
-        
-        // ENTER GRAPHICS CONTEXT
-        obs_enter_graphics();
-        
-        Mat cam1_frame = obs_source_to_mat(context->camera1);
-        Mat cam2_frame = obs_source_to_mat(context->camera2);
-        
-        obs_leave_graphics();
-        // LEAVE GRAPHICS CONTEXT
-        
-        if (!cam1_frame.empty() || !cam2_frame.empty()) {
-            pthread_mutex_lock(&context->frame_mutex);
-            context->cam1_frame = cam1_frame;
-            context->cam2_frame = cam2_frame;
-            context->frames_ready = true;
-            pthread_mutex_unlock(&context->frame_mutex);
-            
-            blog(LOG_INFO, "[DualCam] Frames captured: cam1=%dx%d cam2=%dx%d", 
-                 cam1_frame.cols, cam1_frame.rows, cam2_frame.cols, cam2_frame.rows);
-        }
-    }
-    
-    // Rest of your switching logic...
+    // Check detection results and switch cameras
     pthread_mutex_lock(&context->state_mutex);
     
     int winner = 1;
@@ -597,31 +576,50 @@ static void dualcam_video_tick(void *data, float seconds)
 // Render the active camera
 static void dualcam_video_render(void *data, gs_effect_t *effect)
 {
-	struct dualcam_switcher *context = (struct dualcam_switcher *)data;
-	UNUSED_PARAMETER(effect);
-	
-	obs_source_t *active_source = (context->active_camera == 1) 
-		? context->camera1 
-		: context->camera2;
-	
-	if (!active_source) {
-		blog(LOG_WARNING, "No active camera source");
-		return;
-	}
-	
-	// prevent circular reference
-	if (active_source == context->context) {
-		blog(LOG_ERROR, "Cannot render self - circular reference detected!");
-		return;
-	}
+    struct dualcam_switcher *context = (struct dualcam_switcher *)data;
+    UNUSED_PARAMETER(effect);
+    
+    // Render the active camera
+    obs_source_t *active_source = (context->active_camera == 1) 
+        ? context->camera1 
+        : context->camera2;
+    
+    if (!active_source) {
+        return;
+    }
+    
+    if (active_source == context->context) {
+        blog(LOG_ERROR, "Cannot render self - circular reference detected!");
+        return;
+    }
 
-	if (!obs_source_active(active_source)) {
-		blog(LOG_DEBUG, "DualCam: source is not active!");
-		return;
-	}
-	
-	// Render the active camera's output
-	obs_source_video_render(active_source);
+    if (!obs_source_active(active_source)) {
+        return;
+    }
+    
+    // Capture frames for detection (we're already in graphics context here!)
+    if (!context->manual_mode && ++context->frame_capture_counter >= 10) {
+        context->frame_capture_counter = 0;
+        
+        blog(LOG_INFO, "[DualCam] Capturing frames in video_render...");
+        
+        Mat cam1_frame = obs_source_to_mat(context->camera1);
+        Mat cam2_frame = obs_source_to_mat(context->camera2);
+        
+        if (!cam1_frame.empty() || !cam2_frame.empty()) {
+            pthread_mutex_lock(&context->frame_mutex);
+            context->cam1_frame = cam1_frame;
+            context->cam2_frame = cam2_frame;
+            context->frames_ready = true;
+            pthread_mutex_unlock(&context->frame_mutex);
+            
+            blog(LOG_INFO, "[DualCam] Frames buffered: cam1=%dx%d cam2=%dx%d", 
+                 cam1_frame.cols, cam1_frame.rows, cam2_frame.cols, cam2_frame.rows);
+        }
+    }
+    
+    // Render the active camera's output
+    obs_source_video_render(active_source);
 }
 
 // Get output width
