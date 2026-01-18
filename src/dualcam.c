@@ -27,6 +27,7 @@ struct dualcam_switcher {
 };
 
 // Forward declarations
+// https://docs.obsproject.com/reference-sources
 static const char *dualcam_get_name(void *unused);
 static void *dualcam_create(obs_data_t *settings, obs_source_t *source);
 static void dualcam_destroy(void *data);
@@ -39,6 +40,7 @@ static uint32_t dualcam_get_width(void *data);
 static uint32_t dualcam_get_height(void *data);
 
 // Plugin info structure
+// sets all the functions listed above
 struct obs_source_info dualcam_source_info = {
 	.id = "dualcam_face_switcher",
 	.type = OBS_SOURCE_TYPE_INPUT,
@@ -60,6 +62,9 @@ struct obs_source_info dualcam_source_info = {
 bool obs_module_load(void)
 {
 	blog(LOG_INFO, "DualCam Face Switcher plugin loaded");
+	// since this plugin will operate as a video source for something else
+	// i.e. the output will be input into someplace (like the virtual camera)
+	// we register source
 	obs_register_source(&dualcam_source_info);
 	return true;
 }
@@ -79,7 +84,14 @@ static const char *dualcam_get_name(void *unused)
 // Helper: Add video sources to dropdown
 static bool add_source_to_list(void *data, obs_source_t *source)
 {
+	// PROPERTY = UI ELEMENT
+	// properties are used to enumerate available settings for an object
+	// "typically this is used to generate user interface widgets but can do specific settings as well"
+	// https://docs.obsproject.com/reference-properties
+	//
+	// here, prop is the actual dropdown as passed
 	obs_property_t *prop = (obs_property_t *)data;
+	// passing in another source and saving to caps
 	uint32_t caps = obs_source_get_output_flags(source);
 	
 	// Only add video sources
@@ -96,14 +108,26 @@ static obs_properties_t *dualcam_properties(void *data)
 {
 	UNUSED_PARAMETER(data);
 	
+	// https://docs.obsproject.com/reference-properties
 	obs_properties_t *props = obs_properties_create();
 	
 	// Camera 1 selection
+	// *cam1 IS A DROPDOWN MENU
+	// https://docs.obsproject.com/reference-properties
+	// - name
+	// - description
+	// - type (combo_type_list means not editable)
+	// - format: combo_format_string means string list
 	obs_property_t *cam1 = obs_properties_add_list(props, "camera1",
 		"Camera 1", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+	// obs_enum_sources enumerates sources and calls the callback function we pass into it
+	// here, we have add_source_to_list
+	// so when we enum the sources, we pass that source to add_source_to_list, along with cam1
+	// and then it decides whether or not to add the source to the cam1 dropdown
 	obs_enum_sources(add_source_to_list, cam1);
 	
 	// Camera 2 selection
+	//
 	obs_property_t *cam2 = obs_properties_add_list(props, "camera2",
 		"Camera 2", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
 	obs_enum_sources(add_source_to_list, cam2);
@@ -132,6 +156,7 @@ static void dualcam_get_defaults(obs_data_t *settings)
 // Create plugin instance
 static void *dualcam_create(obs_data_t *settings, obs_source_t *source)
 {
+	// this struct is the same as above
 	struct dualcam_switcher *context = bzalloc(sizeof(struct dualcam_switcher));
 	context->context = source;
 	context->active_camera = 1;
