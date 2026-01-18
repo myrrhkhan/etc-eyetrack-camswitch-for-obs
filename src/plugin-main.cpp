@@ -384,7 +384,7 @@ static obs_properties_t *dualcam_properties(void *data)
 // Set default values
 static void dualcam_get_defaults(obs_data_t *settings)
 {
-	obs_data_set_default_bool(settings, "manual_mode", true);
+	obs_data_set_default_bool(settings, "manual_mode", false);
 	obs_data_set_default_int(settings, "manual_camera", 1);
 	obs_data_set_default_double(settings, "hysteresis_thresh", 0.05);
 }
