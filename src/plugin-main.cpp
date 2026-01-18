@@ -603,8 +603,11 @@ static void dualcam_video_render(void *data, gs_effect_t *effect)
 			
 			if (!cam1_frame.empty() || !cam2_frame.empty()) {
 				pthread_mutex_lock(&context->frame_mutex);
-				context->cam1_frame = cam1_frame;
-				context->cam2_frame = cam2_frame;
+				// CRITICAL: Use .clone() to create deep copies
+				// This ensures thread safety - the detection thread
+				// gets its own copy of the data, not a shared reference
+				context->cam1_frame = cam1_frame.clone();
+				context->cam2_frame = cam2_frame.clone();
 				context->frames_ready = true;
 				pthread_mutex_unlock(&context->frame_mutex);
 				
