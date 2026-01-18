@@ -108,7 +108,7 @@ static Mat obs_source_to_mat(obs_source_t *source)
 static void process_camera_frame(obs_source_t *source, CascadeClassifier *cascade, struct camstate *state)
 {
 	// ensure source and cascades are active
-    if (!source || !cascade) {
+    if (!source || !cascade || cascade->empty()) {
         state->has_eyes = false;
         return;
     }
@@ -360,7 +360,8 @@ static void *dualcam_create(obs_data_t *settings, obs_source_t *source)
 	context->height = 1080;
 
 	context->eye_cascade = new CascadeClassifier();
-	const char *path = get_cascade_path("haarcascade_eye.xml");
+	const char *path = get_cascade_path("haarcascades/haarcascade_eye.xml");
+	blog(LOG_INFO, "=== CASCADE PATH: %s ===", path);
 	if (!context->eye_cascade->load(path)) {
 		blog(LOG_ERROR, "[DualCam] Failed to load cascade: %s", path);
 	}
