@@ -48,6 +48,12 @@ struct dualcam_switcher {
 	// Haar Cascade
 	CascadeClassifier *eye_cascade;
 	pthread_mutex_t state_mutex;
+
+    // ADD: Frame buffers for thread processing
+    Mat cam1_frame;
+    Mat cam2_frame;
+    bool frames_ready;
+    pthread_mutex_t frame_mutex;
 };
 
 // --- HELPER FUNCTIONS ---
@@ -62,20 +68,36 @@ static inline const char *get_cascade_path(const char *filename)
 
 static Mat obs_source_to_mat(obs_source_t *source)
 {
-    if (!source) return Mat();
+    if (!source) {
+        blog(LOG_INFO, "[DualCam] obs_source_to_mat: source is null");
+        return Mat();
+    }
     
-	// ensure dims are nonzero
     uint32_t width = obs_source_get_width(source);
     uint32_t height = obs_source_get_height(source);
-    if (width == 0 || height == 0) return Mat();
+    
+    blog(LOG_INFO, "[DualCam] obs_source_to_mat: source dims %dx%d", width, height);
+    
+    if (width == 0 || height == 0) {
+        blog(LOG_INFO, "[DualCam] obs_source_to_mat: zero dimensions");
+        return Mat();
+    }
 
-    // DOWNSCALE: Performance is much better if we detect on a small image
+    // Downscale for performance
     uint32_t scaled_w = 320;
     uint32_t scaled_h = (height * scaled_w) / width;
+    
+    blog(LOG_INFO, "[DualCam] obs_source_to_mat: scaled dims %dx%d", scaled_w, scaled_h);
 
-	// TODO ASK
     gs_texrender_t *texrender = gs_texrender_create(GS_BGRA, GS_ZS_NONE);
     gs_stagesurf_t *stage = gs_stagesurface_create(scaled_w, scaled_h, GS_BGRA);
+    
+    if (!texrender || !stage) {
+        blog(LOG_ERROR, "[DualCam] Failed to create texrender or stage");
+        if (texrender) gs_texrender_destroy(texrender);
+        if (stage) gs_stagesurface_destroy(stage);
+        return Mat();
+    }
     
     gs_texrender_reset(texrender);
     if (gs_texrender_begin(texrender, scaled_w, scaled_h)) {
@@ -85,9 +107,23 @@ static Mat obs_source_to_mat(obs_source_t *source)
         
         obs_source_video_render(source);
         gs_texrender_end(texrender);
+        
+        blog(LOG_INFO, "[DualCam] obs_source_to_mat: rendered successfully");
+    } else {
+        blog(LOG_ERROR, "[DualCam] gs_texrender_begin failed");
+        gs_texrender_destroy(texrender);
+        gs_stagesurface_destroy(stage);
+        return Mat();
     }
     
     gs_texture_t *tex = gs_texrender_get_texture(texrender);
+    if (!tex) {
+        blog(LOG_ERROR, "[DualCam] Failed to get texture from texrender");
+        gs_texrender_destroy(texrender);
+        gs_stagesurface_destroy(stage);
+        return Mat();
+    }
+    
     gs_stage_texture(stage, tex);
     
     uint8_t *stage_data;
@@ -95,9 +131,13 @@ static Mat obs_source_to_mat(obs_source_t *source)
     Mat result;
 
     if (gs_stagesurface_map(stage, &stage_data, &stage_linesize)) {
+        blog(LOG_INFO, "[DualCam] obs_source_to_mat: mapped stage surface");
         Mat frame(scaled_h, scaled_w, CV_8UC4, stage_data, stage_linesize);
         cvtColor(frame, result, COLOR_BGRA2BGR);
         gs_stagesurface_unmap(stage);
+        blog(LOG_INFO, "[DualCam] obs_source_to_mat: converted to BGR, size %dx%d", result.cols, result.rows);
+    } else {
+        blog(LOG_ERROR, "[DualCam] Failed to map stage surface");
     }
     
     gs_stagesurface_destroy(stage);
@@ -106,52 +146,23 @@ static Mat obs_source_to_mat(obs_source_t *source)
 }
 
 
-static void process_camera_frame(obs_source_t *source, CascadeClassifier *cascade, struct camstate *state)
+static void process_camera_mat(const Mat &frame, CascadeClassifier *cascade, struct camstate *state)
 {
-    blog(LOG_INFO, "[DualCam]   process_camera_frame: source=%p cascade=%p", source, cascade);
-    
-    // ensure source and cascades are active
-    if (!source) {
-        blog(LOG_INFO, "[DualCam]   FAILED: source is null");
+    if (frame.empty() || !cascade || cascade->empty()) {
         state->has_eyes = false;
         return;
     }
-    
-    if (!cascade) {
-        blog(LOG_INFO, "[DualCam]   FAILED: cascade is null");
-        state->has_eyes = false;
-        return;
-    }
-    
-    if (cascade->empty()) {
-        blog(LOG_INFO, "[DualCam]   FAILED: cascade is empty");
-        state->has_eyes = false;
-        return;
-    }
-
-    blog(LOG_INFO, "[DualCam]   Getting frame...");
-    Mat frame = obs_source_to_mat(source);
-    
-    if (frame.empty()) {
-        blog(LOG_INFO, "[DualCam]   FAILED: frame is empty");
-        state->has_eyes = false;
-        return;
-    }
-    
-    blog(LOG_INFO, "[DualCam]   Frame size: %dx%d", frame.cols, frame.rows);
 
     Mat gray;
     cvtColor(frame, gray, COLOR_BGR2GRAY);
     equalizeHist(gray, gray);
 
-    blog(LOG_INFO, "[DualCam]   Running detectMultiScale...");
     std::vector<Rect> eyes;
     cascade->detectMultiScale(gray, eyes, 1.1, 3, 0, Size(30, 30));
 
-    blog(LOG_INFO, "[DualCam]   Detected %zu eyes", eyes.size());
+    blog(LOG_INFO, "[DualCam] Detected %zu eyes", eyes.size());
 
     if (eyes.size() > 0) {
-        // Calculate normalized center distance based on downscaled frame
         float eye_x = (eyes[0].x + eyes[0].width / 2.0f) / (float)frame.cols;
         float eye_y = (eyes[0].y + eyes[0].height / 2.0f) / (float)frame.rows;
         
@@ -161,8 +172,7 @@ static void process_camera_frame(obs_source_t *source, CascadeClassifier *cascad
         state->eye_dist_from_center = sqrtf(dx*dx + dy*dy);
         state->has_eyes = true;
         
-        blog(LOG_INFO, "[DualCam]   Eye found at (%f, %f), distance from center: %f", 
-             eye_x, eye_y, state->eye_dist_from_center);
+        blog(LOG_INFO, "[DualCam] Eye found, distance from center: %f", state->eye_dist_from_center);
     } else {
         state->has_eyes = false;
     }
@@ -172,40 +182,36 @@ static void process_camera_frame(obs_source_t *source, CascadeClassifier *cascad
 static void *face_detection_thread(void *data)
 {
     struct dualcam_switcher *context = (struct dualcam_switcher *)data;
-    blog(LOG_INFO, "[DualCam] ========== DETECTION THREAD STARTED ==========");
+    blog(LOG_INFO, "[DualCam] Detection thread started");
     
-    int frame_count = 0;
     while (!context->stop_thread) {
-        obs_source_t *c1 = obs_source_get_ref(context->camera1);
-        obs_source_t *c2 = obs_source_get_ref(context->camera2);
-
-        blog(LOG_INFO, "[DualCam] Frame %d: c1=%p c2=%p", frame_count++, c1, c2);
-
-        obs_enter_graphics();
+        pthread_mutex_lock(&context->frame_mutex);
         
-        pthread_mutex_lock(&context->state_mutex);
+        if (context->frames_ready) {
+            blog(LOG_INFO, "[DualCam] Processing buffered frames...");
+            
+            Mat cam1_copy = context->cam1_frame.clone();
+            Mat cam2_copy = context->cam2_frame.clone();
+            context->frames_ready = false;
+            
+            pthread_mutex_unlock(&context->frame_mutex);
+            
+            // Process outside the lock
+            pthread_mutex_lock(&context->state_mutex);
+            process_camera_mat(cam1_copy, context->eye_cascade, &context->cam1state);
+            process_camera_mat(cam2_copy, context->eye_cascade, &context->cam2state);
+            pthread_mutex_unlock(&context->state_mutex);
+            
+            blog(LOG_INFO, "[DualCam] Cam1 has_eyes=%d, Cam2 has_eyes=%d", 
+                 context->cam1state.has_eyes, context->cam2state.has_eyes);
+        } else {
+            pthread_mutex_unlock(&context->frame_mutex);
+        }
         
-        blog(LOG_INFO, "[DualCam] Processing cam1...");
-        process_camera_frame(c1, context->eye_cascade, &context->cam1state);
-        blog(LOG_INFO, "[DualCam] Cam1 result: has_eyes=%d dist=%f", 
-             context->cam1state.has_eyes, context->cam1state.eye_dist_from_center);
-        
-        blog(LOG_INFO, "[DualCam] Processing cam2...");
-        process_camera_frame(c2, context->eye_cascade, &context->cam2state);
-        blog(LOG_INFO, "[DualCam] Cam2 result: has_eyes=%d dist=%f", 
-             context->cam2state.has_eyes, context->cam2state.eye_dist_from_center);
-        
-        pthread_mutex_unlock(&context->state_mutex);
-        
-        obs_leave_graphics();
-
-        obs_source_release(c1);
-        obs_source_release(c2);
-        
-        os_sleep_ms(1000);  // Slow down to 1 second for debugging
+        os_sleep_ms(100);  // Check for new frames 10 times per second
     }
     
-    blog(LOG_INFO, "[DualCam] ========== DETECTION THREAD STOPPED ==========");
+    blog(LOG_INFO, "[DualCam] Detection thread stopped");
     return NULL;
 }
 
@@ -259,9 +265,7 @@ static Mat obs_source_to_mat(obs_source_t *source, uint32_t *out_width, uint32_t
  * @param state Pointer to the camera state structure to update
  * @param cam_number Camera number (for logging purposes)
  */
-static void process_camera_frame(const Mat &frame, uint32_t width, uint32_t height,
-                                  CascadeClassifier *cascade, struct camstate *state,
-                                  int cam_number);
+static void process_camera_mat(const Mat &frame, CascadeClassifier *cascade, struct camstate *state);
 
 /**
  * Face detection thread function
@@ -410,6 +414,9 @@ static void *dualcam_create(obs_data_t *settings, obs_source_t *source)
     if (!context->eye_cascade->load(path)) {
         blog(LOG_ERROR, "[DualCam] Failed to load cascade: %s", path);
     }
+
+	pthread_mutex_init(&context->frame_mutex, NULL);
+	context->frames_ready = false;
     
     blog(LOG_INFO, "DualCam switcher created");
     
@@ -447,6 +454,8 @@ static void dualcam_destroy(void *data)
 
 	delete context->eye_cascade;
 	pthread_mutex_destroy(&context->state_mutex);
+
+	pthread_mutex_destroy(&context->frame_mutex);
 	
 	blog(LOG_INFO, "DualCam switcher destroyed");
 	bfree(context);
@@ -523,48 +532,66 @@ static void dualcam_update(void *data, obs_data_t *settings)
 // Called every frame before rendering
 static void dualcam_video_tick(void *data, float seconds)
 {
-	struct dualcam_switcher *context = (struct dualcam_switcher *)data;
-	UNUSED_PARAMETER(seconds);
-	
-	// In auto mode, this is where you'd check face detection results
-	// and switch cameras based on that
-	
-	if (context->manual_mode) return; 
-	
-	pthread_mutex_lock(&context->state_mutex);
-	
-	int winner = 1; // Default, tiebreaker
-	if (context->cam1state.has_eyes && context->cam2state.has_eyes) {
-		blog(LOG_INFO, "they both detected eyes");
-		blog(LOG_INFO, "winner is currently %d", winner);
-		float diff = context->cam1state.eye_dist_from_center - context->cam2state.eye_dist_from_center;
-		if (diff > context->hysteresis_thresh) winner = 2;
-		else if (diff < context->hysteresis_thresh) winner = 1;
-		else winner = context->active_camera;
-		blog(LOG_INFO, "winner is now %d", winner);
-	} else if (context->cam2state.has_eyes) {
-		winner = 2;
-	}
+    struct dualcam_switcher *context = (struct dualcam_switcher *)data;
+    
+    if (context->manual_mode) return;
+    
+    // Capture frames from both cameras
+    static int tick_count = 0;
+    if (++tick_count % 10 == 0) {  // Every 10 frames
+        blog(LOG_INFO, "[DualCam] video_tick: capturing frames...");
+        
+        // ENTER GRAPHICS CONTEXT
+        obs_enter_graphics();
+        
+        Mat cam1_frame = obs_source_to_mat(context->camera1);
+        Mat cam2_frame = obs_source_to_mat(context->camera2);
+        
+        obs_leave_graphics();
+        // LEAVE GRAPHICS CONTEXT
+        
+        if (!cam1_frame.empty() || !cam2_frame.empty()) {
+            pthread_mutex_lock(&context->frame_mutex);
+            context->cam1_frame = cam1_frame;
+            context->cam2_frame = cam2_frame;
+            context->frames_ready = true;
+            pthread_mutex_unlock(&context->frame_mutex);
+            
+            blog(LOG_INFO, "[DualCam] Frames captured: cam1=%dx%d cam2=%dx%d", 
+                 cam1_frame.cols, cam1_frame.rows, cam2_frame.cols, cam2_frame.rows);
+        }
+    }
+    
+    // Rest of your switching logic...
+    pthread_mutex_lock(&context->state_mutex);
+    
+    int winner = 1;
+    if (context->cam1state.has_eyes && context->cam2state.has_eyes) {
+        float diff = context->cam1state.eye_dist_from_center - context->cam2state.eye_dist_from_center;
+        if (diff > context->hysteresis_thresh) winner = 2;
+        else if (diff < -context->hysteresis_thresh) winner = 1;
+        else winner = context->active_camera;
+    } else if (context->cam2state.has_eyes) {
+        winner = 2;
+    }
 
-	pthread_mutex_unlock(&context->state_mutex);
+    pthread_mutex_unlock(&context->state_mutex);
 
-	// 2 second delay
-	// if we need to switch
-	if (winner != context->active_camera) {
-		// if winner is already pending, keep up timer or switch if past 2 seconds
-		if (winner == context->pending_camera) {
-			context->switch_timer += seconds;
-			if (context->switch_timer >= 2.0f) {
-				context->active_camera = winner;
-				context->switch_timer = 0.0f;
-			}
-		} else {
-			context->pending_camera = winner;
-			context->switch_timer = 0.0f;
-		}
-	} else {
-		context->switch_timer = 0.0f;
-	}
+    if (winner != context->active_camera) {
+        if (winner == context->pending_camera) {
+            context->switch_timer += seconds;
+            if (context->switch_timer >= 2.0f) {
+                blog(LOG_INFO, "[DualCam] SWITCHING to camera %d", winner);
+                context->active_camera = winner;
+                context->switch_timer = 0.0f;
+            }
+        } else {
+            context->pending_camera = winner;
+            context->switch_timer = 0.0f;
+        }
+    } else {
+        context->switch_timer = 0.0f;
+    }
 }
 
 // Render the active camera
