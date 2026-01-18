@@ -30,7 +30,7 @@ struct dualcam_switcher {
 	int active_camera;               // 1 or 2
 	bool manual_mode;                // Manual vs auto switching
 	
-	// Face detection state (to be implemented)
+	// Face detection state
 	pthread_t detection_thread;
 	bool thread_running;
 	volatile bool stop_thread;
@@ -46,10 +46,9 @@ struct dualcam_switcher {
 	uint32_t height;
 
 	// Haar Cascade
-	CascadeClassifier *eye_cascade;
+	CascadeClassifier *face_cascade;
 	pthread_mutex_t state_mutex;
 
-    // ADD: Frame buffers for thread processing
 	// Double buffering for thread safety
 	Mat cam1_frame_current;
 	Mat cam2_frame_current;
@@ -60,111 +59,133 @@ struct dualcam_switcher {
 	int frame_capture_counter;
 
 	gs_texrender_t *texrender;
-    gs_stagesurf_t *stage;
-    uint32_t last_w, last_h;
+	gs_stagesurf_t *stage;
+	uint32_t last_w, last_h;
 };
 
 // --- HELPER FUNCTIONS ---
 
 static inline const char *get_cascade_path(const char *filename)
 {
-    static char path[512];
-    const char *data_path = obs_get_module_data_path(obs_current_module());
-    snprintf(path, sizeof(path), "%s/%s", data_path, filename);
-    return path;
+	static char path[512];
+	const char *data_path = obs_get_module_data_path(obs_current_module());
+	snprintf(path, sizeof(path), "%s/%s", data_path, filename);
+	return path;
 }
 
 static Mat obs_source_to_mat(struct dualcam_switcher *context, obs_source_t *source)
 {
-    if (!source) return Mat();
+	if (!source) {
+		blog(LOG_INFO, "[DualCam] obs_source_to_mat: source is NULL");
+		return Mat();
+	}
 
-    uint32_t width = obs_source_get_width(source);
-    uint32_t height = obs_source_get_height(source);
-    if (width == 0 || height == 0) return Mat();
+	uint32_t width = obs_source_get_width(source);
+	uint32_t height = obs_source_get_height(source);
+	
+	blog(LOG_INFO, "[DualCam] obs_source_to_mat: source dimensions %dx%d", width, height);
+	
+	if (width == 0 || height == 0) {
+		blog(LOG_INFO, "[DualCam] obs_source_to_mat: zero dimensions");
+		return Mat();
+	}
 
-    // Downscale targets
-    uint32_t sw = 320;
-    uint32_t sh = (height * sw) / width;
+	// Downscale targets
+	uint32_t sw = 320;
+	uint32_t sh = (height * sw) / width;
+	
+	blog(LOG_INFO, "[DualCam] obs_source_to_mat: scaled to %dx%d", sw, sh);
 
-    // Re-create resources only if size changed or they don't exist
-    if (!context->texrender || context->last_w != sw || context->last_h != sh) {
-        if (context->texrender) gs_texrender_destroy(context->texrender);
-        if (context->stage) gs_stagesurface_destroy(context->stage);
+	// Re-create resources only if size changed or they don't exist
+	if (!context->texrender || context->last_w != sw || context->last_h != sh) {
+		blog(LOG_INFO, "[DualCam] Creating new texrender/stage resources");
+		if (context->texrender) gs_texrender_destroy(context->texrender);
+		if (context->stage) gs_stagesurface_destroy(context->stage);
 
-        context->texrender = gs_texrender_create(GS_BGRA, GS_ZS_NONE);
-        context->stage = gs_stagesurface_create(sw, sh, GS_BGRA);
-        context->last_w = sw;
-        context->last_h = sh;
-    }
+		context->texrender = gs_texrender_create(GS_BGRA, GS_ZS_NONE);
+		context->stage = gs_stagesurface_create(sw, sh, GS_BGRA);
+		context->last_w = sw;
+		context->last_h = sh;
+	}
 
-    Mat result;
-    gs_texrender_reset(context->texrender);
-    
-    if (gs_texrender_begin(context->texrender, sw, sh)) {
-        struct vec4 clear_color = {0};
-        gs_clear(GS_CLEAR_COLOR, &clear_color, 0.0f, 0);
-        gs_ortho(0.0f, (float)sw, 0.0f, (float)sh, -100.0f, 100.0f);
-        
-        obs_source_video_render(source);
-        gs_texrender_end(context->texrender);
-        
-        gs_texture_t *tex = gs_texrender_get_texture(context->texrender);
-        if (tex) {
-            gs_stage_texture(context->stage, tex);
-            
-            uint8_t *data;
-            uint32_t linesize;
-            if (gs_stagesurface_map(context->stage, &data, &linesize)) {
-                // Create a temporary wrapper, then CLONE it to result 
-                // so the data persists after unmap
-                Mat frame(sh, sw, CV_8UC4, data, linesize);
-                cvtColor(frame, result, COLOR_BGRA2BGR);
-                gs_stagesurface_unmap(context->stage);
-            }
-        }
-    }
-    return result; // Returns a BGR Mat with its own allocated memory
+	Mat result;
+	gs_texrender_reset(context->texrender);
+	
+	if (gs_texrender_begin(context->texrender, sw, sh)) {
+		struct vec4 clear_color = {0};
+		gs_clear(GS_CLEAR_COLOR, &clear_color, 0.0f, 0);
+		gs_ortho(0.0f, (float)sw, 0.0f, (float)sh, -100.0f, 100.0f);
+		
+		obs_source_video_render(source);
+		gs_texrender_end(context->texrender);
+		
+		blog(LOG_INFO, "[DualCam] Texrender successful");
+		
+		gs_texture_t *tex = gs_texrender_get_texture(context->texrender);
+		if (tex) {
+			gs_stage_texture(context->stage, tex);
+			
+			uint8_t *data;
+			uint32_t linesize;
+			if (gs_stagesurface_map(context->stage, &data, &linesize)) {
+				blog(LOG_INFO, "[DualCam] Stagesurface mapped successfully");
+				Mat frame(sh, sw, CV_8UC4, data, linesize);
+				cvtColor(frame, result, COLOR_BGRA2BGR);
+				gs_stagesurface_unmap(context->stage);
+				blog(LOG_INFO, "[DualCam] Converted to BGR: %dx%d", result.cols, result.rows);
+			} else {
+				blog(LOG_ERROR, "[DualCam] Failed to map stagesurface");
+			}
+		} else {
+			blog(LOG_ERROR, "[DualCam] Failed to get texture from texrender");
+		}
+	} else {
+		blog(LOG_ERROR, "[DualCam] gs_texrender_begin failed");
+	}
+	
+	return result;
 }
 
 
 static void process_camera_mat(const Mat &frame, CascadeClassifier *cascade, struct camstate *state)
 {
-    if (frame.empty() || !cascade || cascade->empty()) {
-        state->has_eyes = false;
-        return;
-    }
+	if (frame.empty() || !cascade || cascade->empty()) {
+		state->has_eyes = false;
+		return;
+	}
 
-    Mat gray;
-    cvtColor(frame, gray, COLOR_BGR2GRAY);
-    equalizeHist(gray, gray);
+	Mat gray;
+	cvtColor(frame, gray, COLOR_BGR2GRAY);
+	equalizeHist(gray, gray);
 
-    std::vector<Rect> eyes;
-    cascade->detectMultiScale(gray, eyes, 1.1, 3, 0, Size(30, 30));
+	std::vector<Rect> faces;
+	cascade->detectMultiScale(gray, faces, 1.1, 3, 0, Size(30, 30));
 
-    blog(LOG_INFO, "[DualCam] Detected %zu eyes", eyes.size());
+	blog(LOG_INFO, "[DualCam] Detected %zu faces", faces.size());
 
-    if (eyes.size() > 0) {
-        float eye_x = (eyes[0].x + eyes[0].width / 2.0f) / (float)frame.cols;
-        float eye_y = (eyes[0].y + eyes[0].height / 2.0f) / (float)frame.rows;
-        
-        float dx = eye_x - 0.5f;
-        float dy = eye_y - 0.5f;
-        
-        state->eye_dist_from_center = sqrtf(dx*dx + dy*dy);
-        state->has_eyes = true;
-        
-        blog(LOG_INFO, "[DualCam] Eye found, distance from center: %f", state->eye_dist_from_center);
-    } else {
-        state->has_eyes = false;
-    }
+	if (faces.size() > 0) {
+		// Use the first (largest) face
+		float face_x = (faces[0].x + faces[0].width / 2.0f) / (float)frame.cols;
+		float face_y = (faces[0].y + faces[0].height / 2.0f) / (float)frame.rows;
+		
+		float dx = face_x - 0.5f;
+		float dy = face_y - 0.5f;
+		
+		state->eye_dist_from_center = sqrtf(dx*dx + dy*dy);
+		state->has_eyes = true;
+		
+		blog(LOG_INFO, "[DualCam] Face found, distance from center: %f", state->eye_dist_from_center);
+	} else {
+		state->has_eyes = false;
+	}
 }
 
 
 static void *face_detection_thread(void *data)
 {
-    struct dualcam_switcher *context = (struct dualcam_switcher *)data;
-    blog(LOG_INFO, "[DualCam] Detection thread started");
-    
+	struct dualcam_switcher *context = (struct dualcam_switcher *)data;
+	blog(LOG_INFO, "[DualCam] Detection thread started");
+	
 	while (!context->stop_thread) {
 		Mat local_1, local_2;
 		bool has_work = false;
@@ -180,74 +201,33 @@ static void *face_detection_thread(void *data)
 
 		if (has_work) {
 			pthread_mutex_lock(&context->state_mutex);
-			process_camera_mat(local_1, context->eye_cascade, &context->cam1state);
-			process_camera_mat(local_2, context->eye_cascade, &context->cam2state);
+			process_camera_mat(local_1, context->face_cascade, &context->cam1state);
+			process_camera_mat(local_2, context->face_cascade, &context->cam2state);
 			pthread_mutex_unlock(&context->state_mutex);
 		}
 		os_sleep_ms(100);
 	}
-    
-    blog(LOG_INFO, "[DualCam] Detection thread stopped");
-    return NULL;
+	
+	blog(LOG_INFO, "[DualCam] Detection thread stopped");
+	return NULL;
 }
 
 // Forward declarations
-// https://docs.obsproject.com/reference-sources
 static const char *dualcam_get_name(void *unused);
-static void *dualcam_create(obs_data_t *settings, obs_source_t *source); // allocates
+static void *dualcam_create(obs_data_t *settings, obs_source_t *source);
 static void dualcam_destroy(void *data);
-static void dualcam_update(void *data, obs_data_t *settings); // called when settings change
-static void dualcam_video_render(void *data, gs_effect_t *effect); // draws output
-static void dualcam_video_tick(void *data, float seconds); // called once per frame
-static obs_properties_t *dualcam_properties(void *data); // creates UI for settings
+static void dualcam_update(void *data, obs_data_t *settings);
+static void dualcam_video_render(void *data, gs_effect_t *effect);
+static void dualcam_video_tick(void *data, float seconds);
+static obs_properties_t *dualcam_properties(void *data);
 static void dualcam_get_defaults(obs_data_t *settings);
 static uint32_t dualcam_get_width(void *data);
 static uint32_t dualcam_get_height(void *data);
-
-
-
-/**
- * Convert OBS source frame to OpenCV Mat
- * 
- * Renders an OBS source into a texture, reads the pixel data,
- * and converts it to an OpenCV Mat in BGR format for processing.
- * 
- * @param source The OBS source to capture
- * @param out_width Pointer to store the frame width
- * @param out_height Pointer to store the frame height
- * @return OpenCV Mat containing the frame in BGR format, or empty Mat on failure
- */
-static Mat obs_source_to_mat(obs_source_t *source);
-
-
-/**
- * Process a single camera frame for eye detection
- * 
- * Takes a camera frame, converts it to grayscale, runs eye detection,
- * and updates the camera state with the results.
- * 
- * @param frame OpenCV Mat containing the camera frame in BGR format
- * @param width Frame width in pixels
- * @param height Frame height in pixels
- * @param cascade Pointer to the loaded Haar cascade classifier
- * @param state Pointer to the camera state structure to update
- * @param cam_number Camera number (for logging purposes)
- */
+static Mat obs_source_to_mat(struct dualcam_switcher *context, obs_source_t *source);
 static void process_camera_mat(const Mat &frame, CascadeClassifier *cascade, struct camstate *state);
-
-/**
- * Face detection thread function
- * 
- * Continuously captures frames from both cameras, runs eye detection,
- * and updates the camera states. Runs at approximately 30fps.
- * 
- * @param data Pointer to the dualcam_switcher context
- * @return NULL on thread exit
- */
 static void *face_detection_thread(void *data);
 
 // Plugin info structure
-// sets all the functions listed above
 struct obs_source_info dualcam_source_info = {
 	.id = "dualcam_face_switcher",
 	.type = OBS_SOURCE_TYPE_INPUT,
@@ -269,9 +249,6 @@ struct obs_source_info dualcam_source_info = {
 bool obs_module_load(void)
 {
 	blog(LOG_INFO, "DualCam Face Switcher plugin loaded");
-	// since this plugin will operate as a video source for something else
-	// i.e. the output will be input into someplace (like the virtual camera)
-	// we register source
 	obs_register_source(&dualcam_source_info);
 	return true;
 }
@@ -291,14 +268,7 @@ static const char *dualcam_get_name(void *unused)
 // Helper: Add video sources to dropdown
 static bool add_source_to_list(void *data, obs_source_t *source)
 {
-	// PROPERTY = UI ELEMENT
-	// properties are used to enumerate available settings for an object
-	// "typically this is used to generate user interface widgets but can do specific settings as well"
-	// https://docs.obsproject.com/reference-properties
-	//
-	// here, prop is the actual dropdown as passed
 	obs_property_t *prop = (obs_property_t *)data;
-	// passing in another source and saving to caps
 	uint32_t caps = obs_source_get_output_flags(source);
 	
 	// Only add video sources
@@ -315,26 +285,14 @@ static obs_properties_t *dualcam_properties(void *data)
 {
 	UNUSED_PARAMETER(data);
 	
-	// https://docs.obsproject.com/reference-properties
 	obs_properties_t *props = obs_properties_create();
 	
 	// Camera 1 selection
-	// *cam1 IS A DROPDOWN MENU
-	// https://docs.obsproject.com/reference-properties
-	// - name
-	// - description
-	// - type (combo_type_list means not editable)
-	// - format: combo_format_string means string list
 	obs_property_t *cam1 = obs_properties_add_list(props, "camera1",
 		"Camera 1", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
-	// obs_enum_sources enumerates sources and calls the callback function we pass into it
-	// here, we have add_source_to_list
-	// so when we enum the sources, we pass that source to add_source_to_list, along with cam1
-	// and then it decides whether or not to add the source to the cam1 dropdown
 	obs_enum_sources(add_source_to_list, cam1);
 	
 	// Camera 2 selection
-	//
 	obs_property_t *cam2 = obs_properties_add_list(props, "camera2",
 		"Camera 2", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
 	obs_enum_sources(add_source_to_list, cam2);
@@ -347,8 +305,6 @@ static obs_properties_t *dualcam_properties(void *data)
 		"Active Camera", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
 	obs_property_list_add_int(manual_select, "Camera 1", 1);
 	obs_property_list_add_int(manual_select, "Camera 2", 2);
-	
-	// Future: Add face detection sensitivity, switching delay, etc.
 	
 	return props;
 }
@@ -364,40 +320,44 @@ static void dualcam_get_defaults(obs_data_t *settings)
 // Create plugin instance
 static void *dualcam_create(obs_data_t *settings, obs_source_t *source)
 {
-    struct dualcam_switcher *context = (struct dualcam_switcher *)bzalloc(sizeof(struct dualcam_switcher));
-    context->context = source;
-    context->active_camera = 1;
+	struct dualcam_switcher *context = (struct dualcam_switcher *)bzalloc(sizeof(struct dualcam_switcher));
+	context->context = source;
+	context->active_camera = 1;
 
-    pthread_mutex_init(&context->state_mutex, NULL);
+	pthread_mutex_init(&context->state_mutex, NULL);
 
-    context->manual_mode = true;
-    context->thread_running = false;
-    context->stop_thread = false;
-    context->width = 1920;
-    context->height = 1080;
+	context->manual_mode = true;
+	context->thread_running = false;
+	context->stop_thread = false;
+	context->width = 1920;
+	context->height = 1080;
 
-    context->eye_cascade = new CascadeClassifier();
-    const char *path = get_cascade_path("haarcascades/haarcascade_eye.xml");
-    blog(LOG_INFO, "=== CASCADE PATH: %s ===", path);
-    if (!context->eye_cascade->load(path)) {
-        blog(LOG_ERROR, "[DualCam] Failed to load cascade: %s", path);
-    }
+	// Initialize graphics resources
+	context->texrender = NULL;
+	context->stage = NULL;
+	context->last_w = 0;
+	context->last_h = 0;
+
+	context->face_cascade = new CascadeClassifier();
+	const char *path = get_cascade_path("haarcascades/haarcascade_frontalface_default.xml");
+	blog(LOG_INFO, "=== CASCADE PATH: %s ===", path);
+	if (!context->face_cascade->load(path)) {
+		blog(LOG_ERROR, "[DualCam] Failed to load cascade: %s", path);
+	} else {
+		blog(LOG_INFO, "[DualCam] Cascade loaded successfully! Empty=%d", context->face_cascade->empty());
+	}
 
 	pthread_mutex_init(&context->frame_mutex, NULL);
 	context->frames_ready = false;
-
 	context->frame_capture_counter = 0;
 
-    
-    blog(LOG_INFO, "DualCam switcher created");
-    
-    // ADD THIS LOG
-    blog(LOG_INFO, "[DualCam] About to call dualcam_update from create...");
-    
-    // Apply initial settings
-    dualcam_update(context, settings);
-    
-    return context;
+	blog(LOG_INFO, "DualCam switcher created");
+	blog(LOG_INFO, "[DualCam] About to call dualcam_update from create...");
+	
+	// Apply initial settings
+	dualcam_update(context, settings);
+	
+	return context;
 }
 
 // Destroy plugin instance
@@ -411,6 +371,16 @@ static void dualcam_destroy(void *data)
 		pthread_join(context->detection_thread, NULL);
 	}
 	
+	// Clean up graphics resources
+	obs_enter_graphics();
+	if (context->texrender) {
+		gs_texrender_destroy(context->texrender);
+	}
+	if (context->stage) {
+		gs_stagesurface_destroy(context->stage);
+	}
+	obs_leave_graphics();
+	
 	// Release camera sources
 	if (context->camera1) {
 		obs_source_release(context->camera1);
@@ -423,9 +393,8 @@ static void dualcam_destroy(void *data)
 	bfree(context->camera1_name);
 	bfree(context->camera2_name);
 
-	delete context->eye_cascade;
+	delete context->face_cascade;
 	pthread_mutex_destroy(&context->state_mutex);
-
 	pthread_mutex_destroy(&context->frame_mutex);
 	
 	blog(LOG_INFO, "DualCam switcher destroyed");
@@ -435,108 +404,108 @@ static void dualcam_destroy(void *data)
 // Update settings
 static void dualcam_update(void *data, obs_data_t *settings)
 {
-    struct dualcam_switcher *context = (struct dualcam_switcher *)data;
-    
-    blog(LOG_INFO, "[DualCam] ========== UPDATE CALLED ==========");
-    
-    // Get camera names from settings
-    const char *cam1_name = obs_data_get_string(settings, "camera1");
-    const char *cam2_name = obs_data_get_string(settings, "camera2");
-    
-    context->manual_mode = obs_data_get_bool(settings, "manual_mode");
-    blog(LOG_INFO, "[DualCam] Manual mode: %d", context->manual_mode);
-    
-    if (context->manual_mode) {
-        blog(LOG_INFO, "[DualCam] In manual mode, stopping thread if running");
-        if (context->thread_running) {
-            context->stop_thread = true;
-            pthread_join(context->detection_thread, NULL);
-            context->thread_running = false;
-        }
-        context->active_camera = (int)obs_data_get_int(settings, "manual_camera");
-    } else if (!context->thread_running) {
-        blog(LOG_INFO, "[DualCam] AUTO MODE - Starting detection thread...");
-        context->stop_thread = false;
-        int result = pthread_create(&context->detection_thread, NULL, face_detection_thread, context);
-        context->thread_running = (result == 0);
-        blog(LOG_INFO, "[DualCam] pthread_create result: %d, thread_running: %d", result, context->thread_running);
-    } else {
-        blog(LOG_INFO, "[DualCam] Thread already running");
-    }
-    
-    // Update camera 1 reference
-    if (cam1_name && strlen(cam1_name) > 0) {
-        if (context->camera1) {
-            obs_source_release(context->camera1);
-        }
-        context->camera1 = obs_get_source_by_name(cam1_name);
-        
-        bfree(context->camera1_name);
-        context->camera1_name = bstrdup(cam1_name);
-        
-        blog(LOG_INFO, "Camera 1 set to: %s (source=%p)", cam1_name, context->camera1);
-    }
-    
-    // Update camera 2 reference
-    if (cam2_name && strlen(cam2_name) > 0) {
-        if (context->camera2) {
-            obs_source_release(context->camera2);
-        }
-        context->camera2 = obs_get_source_by_name(cam2_name);
-        
-        bfree(context->camera2_name);
-        context->camera2_name = bstrdup(cam2_name);
-        
-        blog(LOG_INFO, "Camera 2 set to: %s (source=%p)", cam2_name, context->camera2);
-    }
-    
-    // Update dimensions from active camera
-    obs_source_t *active = (context->active_camera == 1) ? context->camera1 : context->camera2;
-    if (active) {
-        context->width = obs_source_get_width(active);
-        context->height = obs_source_get_height(active);
-    }
-    
-    blog(LOG_INFO, "[DualCam] ========== UPDATE COMPLETE ==========");
+	struct dualcam_switcher *context = (struct dualcam_switcher *)data;
+	
+	blog(LOG_INFO, "[DualCam] ========== UPDATE CALLED ==========");
+	
+	// Get camera names from settings
+	const char *cam1_name = obs_data_get_string(settings, "camera1");
+	const char *cam2_name = obs_data_get_string(settings, "camera2");
+	
+	context->manual_mode = obs_data_get_bool(settings, "manual_mode");
+	blog(LOG_INFO, "[DualCam] Manual mode: %d", context->manual_mode);
+	
+	if (context->manual_mode) {
+		blog(LOG_INFO, "[DualCam] In manual mode, stopping thread if running");
+		if (context->thread_running) {
+			context->stop_thread = true;
+			pthread_join(context->detection_thread, NULL);
+			context->thread_running = false;
+		}
+		context->active_camera = (int)obs_data_get_int(settings, "manual_camera");
+	} else if (!context->thread_running) {
+		blog(LOG_INFO, "[DualCam] AUTO MODE - Starting detection thread...");
+		context->stop_thread = false;
+		int result = pthread_create(&context->detection_thread, NULL, face_detection_thread, context);
+		context->thread_running = (result == 0);
+		blog(LOG_INFO, "[DualCam] pthread_create result: %d, thread_running: %d", result, context->thread_running);
+	} else {
+		blog(LOG_INFO, "[DualCam] Thread already running");
+	}
+	
+	// Update camera 1 reference
+	if (cam1_name && strlen(cam1_name) > 0) {
+		if (context->camera1) {
+			obs_source_release(context->camera1);
+		}
+		context->camera1 = obs_get_source_by_name(cam1_name);
+		
+		bfree(context->camera1_name);
+		context->camera1_name = bstrdup(cam1_name);
+		
+		blog(LOG_INFO, "Camera 1 set to: %s (source=%p)", cam1_name, context->camera1);
+	}
+	
+	// Update camera 2 reference
+	if (cam2_name && strlen(cam2_name) > 0) {
+		if (context->camera2) {
+			obs_source_release(context->camera2);
+		}
+		context->camera2 = obs_get_source_by_name(cam2_name);
+		
+		bfree(context->camera2_name);
+		context->camera2_name = bstrdup(cam2_name);
+		
+		blog(LOG_INFO, "Camera 2 set to: %s (source=%p)", cam2_name, context->camera2);
+	}
+	
+	// Update dimensions from active camera
+	obs_source_t *active = (context->active_camera == 1) ? context->camera1 : context->camera2;
+	if (active) {
+		context->width = obs_source_get_width(active);
+		context->height = obs_source_get_height(active);
+	}
+	
+	blog(LOG_INFO, "[DualCam] ========== UPDATE COMPLETE ==========");
 }
 
 // Called every frame before rendering
 static void dualcam_video_tick(void *data, float seconds)
 {
-    struct dualcam_switcher *context = (struct dualcam_switcher *)data;
-    
-    if (context->manual_mode) return;
-    
-    // NO GRAPHICS CALLS HERE - just switching logic
-    pthread_mutex_lock(&context->state_mutex);
-    
-    int winner = 1;
-    if (context->cam1state.has_eyes && context->cam2state.has_eyes) {
-        float diff = context->cam1state.eye_dist_from_center - context->cam2state.eye_dist_from_center;
-        if (diff > context->hysteresis_thresh) winner = 2;
-        else if (diff < -context->hysteresis_thresh) winner = 1;
-        else winner = context->active_camera;
-    } else if (context->cam2state.has_eyes) {
-        winner = 2;
-    }
+	struct dualcam_switcher *context = (struct dualcam_switcher *)data;
+	
+	if (context->manual_mode) return;
+	
+	// NO GRAPHICS CALLS HERE - just switching logic
+	pthread_mutex_lock(&context->state_mutex);
+	
+	int winner = 1;
+	if (context->cam1state.has_eyes && context->cam2state.has_eyes) {
+		float diff = context->cam1state.eye_dist_from_center - context->cam2state.eye_dist_from_center;
+		if (diff > context->hysteresis_thresh) winner = 2;
+		else if (diff < -context->hysteresis_thresh) winner = 1;
+		else winner = context->active_camera;
+	} else if (context->cam2state.has_eyes) {
+		winner = 2;
+	}
 
-    pthread_mutex_unlock(&context->state_mutex);
+	pthread_mutex_unlock(&context->state_mutex);
 
-    if (winner != context->active_camera) {
-        if (winner == context->pending_camera) {
-            context->switch_timer += seconds;
-            if (context->switch_timer >= 2.0f) {
-                blog(LOG_INFO, "[DualCam] SWITCHING to camera %d", winner);
-                context->active_camera = winner;
-                context->switch_timer = 0.0f;
-            }
-        } else {
-            context->pending_camera = winner;
-            context->switch_timer = 0.0f;
-        }
-    } else {
-        context->switch_timer = 0.0f;
-    }
+	if (winner != context->active_camera) {
+		if (winner == context->pending_camera) {
+			context->switch_timer += seconds;
+			if (context->switch_timer >= 2.0f) {
+				blog(LOG_INFO, "[DualCam] SWITCHING to camera %d", winner);
+				context->active_camera = winner;
+				context->switch_timer = 0.0f;
+			}
+		} else {
+			context->pending_camera = winner;
+			context->switch_timer = 0.0f;
+		}
+	} else {
+		context->switch_timer = 0.0f;
+	}
 }
 
 // Render the active camera
