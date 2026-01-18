@@ -282,8 +282,25 @@ static void dualcam_video_render(void *data, gs_effect_t *effect)
 		: context->camera2;
 	
 	if (!active_source) {
+		blog(LOG_WARNING, "No active camera source");
 		return;
 	}
+	
+	// prevent circular reference
+	if (active_source == context->context) {
+		blog(LOG_ERROR, "Cannot render self - circular reference detected!");
+		return;
+	}
+
+	if (!obs_source_active(active_source)) {
+		blog(LOG_DEBUG, "DualCam: source is not active!");
+		return;
+	}
+
+	// Log what we're rendering (remove this after debugging)
+	const char *source_name = obs_source_get_name(active_source);
+	blog(LOG_DEBUG, "DualCam: Rendering camera %d (%s)", 
+	     context->active_camera, source_name ? source_name : "unknown");
 	
 	// Render the active camera's output
 	obs_source_video_render(active_source);
