@@ -105,23 +105,50 @@ static Mat obs_source_to_mat(obs_source_t *source)
     return result;
 }
 
+
 static void process_camera_frame(obs_source_t *source, CascadeClassifier *cascade, struct camstate *state)
 {
-	// ensure source and cascades are active
-    if (!source || !cascade || cascade->empty()) {
+    blog(LOG_INFO, "[DualCam]   process_camera_frame: source=%p cascade=%p", source, cascade);
+    
+    // ensure source and cascades are active
+    if (!source) {
+        blog(LOG_INFO, "[DualCam]   FAILED: source is null");
+        state->has_eyes = false;
+        return;
+    }
+    
+    if (!cascade) {
+        blog(LOG_INFO, "[DualCam]   FAILED: cascade is null");
+        state->has_eyes = false;
+        return;
+    }
+    
+    if (cascade->empty()) {
+        blog(LOG_INFO, "[DualCam]   FAILED: cascade is empty");
         state->has_eyes = false;
         return;
     }
 
+    blog(LOG_INFO, "[DualCam]   Getting frame...");
     Mat frame = obs_source_to_mat(source);
-    if (frame.empty()) return;
+    
+    if (frame.empty()) {
+        blog(LOG_INFO, "[DualCam]   FAILED: frame is empty");
+        state->has_eyes = false;
+        return;
+    }
+    
+    blog(LOG_INFO, "[DualCam]   Frame size: %dx%d", frame.cols, frame.rows);
 
     Mat gray;
     cvtColor(frame, gray, COLOR_BGR2GRAY);
     equalizeHist(gray, gray);
 
+    blog(LOG_INFO, "[DualCam]   Running detectMultiScale...");
     std::vector<Rect> eyes;
     cascade->detectMultiScale(gray, eyes, 1.1, 3, 0, Size(30, 30));
+
+    blog(LOG_INFO, "[DualCam]   Detected %zu eyes", eyes.size());
 
     if (eyes.size() > 0) {
         // Calculate normalized center distance based on downscaled frame
@@ -133,24 +160,41 @@ static void process_camera_frame(obs_source_t *source, CascadeClassifier *cascad
         
         state->eye_dist_from_center = sqrtf(dx*dx + dy*dy);
         state->has_eyes = true;
+        
+        blog(LOG_INFO, "[DualCam]   Eye found at (%f, %f), distance from center: %f", 
+             eye_x, eye_y, state->eye_dist_from_center);
     } else {
         state->has_eyes = false;
     }
 }
 
+
 static void *face_detection_thread(void *data)
 {
     struct dualcam_switcher *context = (struct dualcam_switcher *)data;
+    blog(LOG_INFO, "[DualCam] ========== DETECTION THREAD STARTED ==========");
     
+    int frame_count = 0;
     while (!context->stop_thread) {
         obs_source_t *c1 = obs_source_get_ref(context->camera1);
         obs_source_t *c2 = obs_source_get_ref(context->camera2);
 
+        blog(LOG_INFO, "[DualCam] Frame %d: c1=%p c2=%p", frame_count++, c1, c2);
+
         obs_enter_graphics();
         
         pthread_mutex_lock(&context->state_mutex);
+        
+        blog(LOG_INFO, "[DualCam] Processing cam1...");
         process_camera_frame(c1, context->eye_cascade, &context->cam1state);
+        blog(LOG_INFO, "[DualCam] Cam1 result: has_eyes=%d dist=%f", 
+             context->cam1state.has_eyes, context->cam1state.eye_dist_from_center);
+        
+        blog(LOG_INFO, "[DualCam] Processing cam2...");
         process_camera_frame(c2, context->eye_cascade, &context->cam2state);
+        blog(LOG_INFO, "[DualCam] Cam2 result: has_eyes=%d dist=%f", 
+             context->cam2state.has_eyes, context->cam2state.eye_dist_from_center);
+        
         pthread_mutex_unlock(&context->state_mutex);
         
         obs_leave_graphics();
@@ -158,8 +202,10 @@ static void *face_detection_thread(void *data)
         obs_source_release(c1);
         obs_source_release(c2);
         
-        os_sleep_ms(33);
+        os_sleep_ms(1000);  // Slow down to 1 second for debugging
     }
+    
+    blog(LOG_INFO, "[DualCam] ========== DETECTION THREAD STOPPED ==========");
     return NULL;
 }
 
@@ -407,53 +453,69 @@ static void dualcam_destroy(void *data)
 // Update settings
 static void dualcam_update(void *data, obs_data_t *settings)
 {
-	struct dualcam_switcher *context = (struct dualcam_switcher *)data;
-	
-	// Get camera names from settings
-	const char *cam1_name = obs_data_get_string(settings, "camera1");
-	const char *cam2_name = obs_data_get_string(settings, "camera2");
-	
-	context->manual_mode = obs_data_get_bool(settings, "manual_mode");
-	
-	if (context->manual_mode) {
-		context->active_camera = (int)obs_data_get_int(settings, "manual_camera");
-	} else if (!context->thread_running) {
-		context->stop_thread = false;
-		context->thread_running = (pthread_create(&context->detection_thread, NULL, face_detection_thread, context) == 0);
-	}
-	
-	// Update camera 1 reference
-	if (cam1_name && strlen(cam1_name) > 0) {
-		if (context->camera1) {
-			obs_source_release(context->camera1);
-		}
-		context->camera1 = obs_get_source_by_name(cam1_name);
-		
-		bfree(context->camera1_name);
-		context->camera1_name = bstrdup(cam1_name);
-		
-		blog(LOG_INFO, "Camera 1 set to: %s", cam1_name);
-	}
-	
-	// Update camera 2 reference
-	if (cam2_name && strlen(cam2_name) > 0) {
-		if (context->camera2) {
-			obs_source_release(context->camera2);
-		}
-		context->camera2 = obs_get_source_by_name(cam2_name);
-		
-		bfree(context->camera2_name);
-		context->camera2_name = bstrdup(cam2_name);
-		
-		blog(LOG_INFO, "Camera 2 set to: %s", cam2_name);
-	}
-	
-	// Update dimensions from active camera
-	obs_source_t *active = (context->active_camera == 1) ? context->camera1 : context->camera2;
-	if (active) {
-		context->width = obs_source_get_width(active);
-		context->height = obs_source_get_height(active);
-	}
+    struct dualcam_switcher *context = (struct dualcam_switcher *)data;
+    
+    blog(LOG_INFO, "[DualCam] ========== UPDATE CALLED ==========");
+    
+    // Get camera names from settings
+    const char *cam1_name = obs_data_get_string(settings, "camera1");
+    const char *cam2_name = obs_data_get_string(settings, "camera2");
+    
+    context->manual_mode = obs_data_get_bool(settings, "manual_mode");
+    blog(LOG_INFO, "[DualCam] Manual mode: %d", context->manual_mode);
+    
+    if (context->manual_mode) {
+        blog(LOG_INFO, "[DualCam] In manual mode, stopping thread if running");
+        if (context->thread_running) {
+            context->stop_thread = true;
+            pthread_join(context->detection_thread, NULL);
+            context->thread_running = false;
+        }
+        context->active_camera = (int)obs_data_get_int(settings, "manual_camera");
+    } else if (!context->thread_running) {
+        blog(LOG_INFO, "[DualCam] AUTO MODE - Starting detection thread...");
+        context->stop_thread = false;
+        int result = pthread_create(&context->detection_thread, NULL, face_detection_thread, context);
+        context->thread_running = (result == 0);
+        blog(LOG_INFO, "[DualCam] pthread_create result: %d, thread_running: %d", result, context->thread_running);
+    } else {
+        blog(LOG_INFO, "[DualCam] Thread already running");
+    }
+    
+    // Update camera 1 reference
+    if (cam1_name && strlen(cam1_name) > 0) {
+        if (context->camera1) {
+            obs_source_release(context->camera1);
+        }
+        context->camera1 = obs_get_source_by_name(cam1_name);
+        
+        bfree(context->camera1_name);
+        context->camera1_name = bstrdup(cam1_name);
+        
+        blog(LOG_INFO, "Camera 1 set to: %s (source=%p)", cam1_name, context->camera1);
+    }
+    
+    // Update camera 2 reference
+    if (cam2_name && strlen(cam2_name) > 0) {
+        if (context->camera2) {
+            obs_source_release(context->camera2);
+        }
+        context->camera2 = obs_get_source_by_name(cam2_name);
+        
+        bfree(context->camera2_name);
+        context->camera2_name = bstrdup(cam2_name);
+        
+        blog(LOG_INFO, "Camera 2 set to: %s (source=%p)", cam2_name, context->camera2);
+    }
+    
+    // Update dimensions from active camera
+    obs_source_t *active = (context->active_camera == 1) ? context->camera1 : context->camera2;
+    if (active) {
+        context->width = obs_source_get_width(active);
+        context->height = obs_source_get_height(active);
+    }
+    
+    blog(LOG_INFO, "[DualCam] ========== UPDATE COMPLETE ==========");
 }
 
 // Called every frame before rendering
