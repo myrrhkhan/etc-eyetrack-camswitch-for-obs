@@ -392,32 +392,34 @@ static void dualcam_get_defaults(obs_data_t *settings)
 // Create plugin instance
 static void *dualcam_create(obs_data_t *settings, obs_source_t *source)
 {
-	// this struct is the same as above
-	struct dualcam_switcher *context = (struct dualcam_switcher *)bzalloc(sizeof(struct dualcam_switcher));
-	context->context = source;
-	context->active_camera = 1;
+    struct dualcam_switcher *context = (struct dualcam_switcher *)bzalloc(sizeof(struct dualcam_switcher));
+    context->context = source;
+    context->active_camera = 1;
 
-	pthread_mutex_init(&context->state_mutex, NULL);
+    pthread_mutex_init(&context->state_mutex, NULL);
 
-	context->manual_mode = true;
-	context->thread_running = false;
-	context->stop_thread = false;
-	context->width = 1920;
-	context->height = 1080;
+    context->manual_mode = true;
+    context->thread_running = false;
+    context->stop_thread = false;
+    context->width = 1920;
+    context->height = 1080;
 
-	context->eye_cascade = new CascadeClassifier();
-	const char *path = get_cascade_path("haarcascades/haarcascade_eye.xml");
-	blog(LOG_INFO, "=== CASCADE PATH: %s ===", path);
-	if (!context->eye_cascade->load(path)) {
-		blog(LOG_ERROR, "[DualCam] Failed to load cascade: %s", path);
-	}
-	
-	blog(LOG_INFO, "DualCam switcher created");
-	
-	// Apply initial settings
-	dualcam_update(context, settings);
-	
-	return context;
+    context->eye_cascade = new CascadeClassifier();
+    const char *path = get_cascade_path("haarcascades/haarcascade_eye.xml");
+    blog(LOG_INFO, "=== CASCADE PATH: %s ===", path);
+    if (!context->eye_cascade->load(path)) {
+        blog(LOG_ERROR, "[DualCam] Failed to load cascade: %s", path);
+    }
+    
+    blog(LOG_INFO, "DualCam switcher created");
+    
+    // ADD THIS LOG
+    blog(LOG_INFO, "[DualCam] About to call dualcam_update from create...");
+    
+    // Apply initial settings
+    dualcam_update(context, settings);
+    
+    return context;
 }
 
 // Destroy plugin instance
