@@ -471,10 +471,13 @@ static void dualcam_video_tick(void *data, float seconds)
 	
 	int winner = 1; // Default, tiebreaker
 	if (context->cam1state.has_eyes && context->cam2state.has_eyes) {
+		blog(LOG_INFO, "they both detected eyes");
+		blog(LOG_INFO, "winner is currently %d", winner);
 		float diff = context->cam1state.eye_dist_from_center - context->cam2state.eye_dist_from_center;
 		if (diff > context->hysteresis_thresh) winner = 2;
 		else if (diff < context->hysteresis_thresh) winner = 1;
 		else winner = context->active_camera;
+		blog(LOG_INFO, "winner is now %d", winner);
 	} else if (context->cam2state.has_eyes) {
 		winner = 2;
 	}
