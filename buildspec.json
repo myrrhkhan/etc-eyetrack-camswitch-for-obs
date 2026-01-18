@@ -38,7 +38,7 @@
   },
   "name": "ETC-eyetrack-camswitch-for-obs",
   "displayName": "ETC: An Eyetracking-Based Camera Switcher for OBS",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "author": "Myrrh Khan",
   "website": "https://myrrhkhan.github.io",
   "email": "mskhan@wpi.edu"
