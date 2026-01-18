@@ -58,6 +58,10 @@ struct dualcam_switcher {
 	bool frames_ready;
 	pthread_mutex_t frame_mutex;
 	int frame_capture_counter;
+
+	gs_texrender_t *texrender;
+    gs_stagesurf_t *stage;
+    uint32_t last_w, last_h;
 };
 
 // --- HELPER FUNCTIONS ---
@@ -70,83 +74,56 @@ static inline const char *get_cascade_path(const char *filename)
     return path;
 }
 
-static Mat obs_source_to_mat(obs_source_t *source)
+static Mat obs_source_to_mat(struct dualcam_switcher *context, obs_source_t *source)
 {
-    if (!source) {
-        blog(LOG_INFO, "[DualCam] obs_source_to_mat: source is null");
-        return Mat();
-    }
-    
+    if (!source) return Mat();
+
     uint32_t width = obs_source_get_width(source);
     uint32_t height = obs_source_get_height(source);
-    
-    blog(LOG_INFO, "[DualCam] obs_source_to_mat: source dims %dx%d", width, height);
-    
-    if (width == 0 || height == 0) {
-        blog(LOG_INFO, "[DualCam] obs_source_to_mat: zero dimensions");
-        return Mat();
+    if (width == 0 || height == 0) return Mat();
+
+    // Downscale targets
+    uint32_t sw = 320;
+    uint32_t sh = (height * sw) / width;
+
+    // Re-create resources only if size changed or they don't exist
+    if (!context->texrender || context->last_w != sw || context->last_h != sh) {
+        if (context->texrender) gs_texrender_destroy(context->texrender);
+        if (context->stage) gs_stagesurface_destroy(context->stage);
+
+        context->texrender = gs_texrender_create(GS_BGRA, GS_ZS_NONE);
+        context->stage = gs_stagesurface_create(sw, sh, GS_BGRA);
+        context->last_w = sw;
+        context->last_h = sh;
     }
 
-    // Downscale for performance
-    uint32_t scaled_w = 320;
-    uint32_t scaled_h = (height * scaled_w) / width;
+    Mat result;
+    gs_texrender_reset(context->texrender);
     
-    blog(LOG_INFO, "[DualCam] obs_source_to_mat: scaled dims %dx%d", scaled_w, scaled_h);
-
-    gs_texrender_t *texrender = gs_texrender_create(GS_BGRA, GS_ZS_NONE);
-    gs_stagesurf_t *stage = gs_stagesurface_create(scaled_w, scaled_h, GS_BGRA);
-    
-    if (!texrender || !stage) {
-        blog(LOG_ERROR, "[DualCam] Failed to create texrender or stage");
-        if (texrender) gs_texrender_destroy(texrender);
-        if (stage) gs_stagesurface_destroy(stage);
-        return Mat();
-    }
-    
-    gs_texrender_reset(texrender);
-    if (gs_texrender_begin(texrender, scaled_w, scaled_h)) {
+    if (gs_texrender_begin(context->texrender, sw, sh)) {
         struct vec4 clear_color = {0};
         gs_clear(GS_CLEAR_COLOR, &clear_color, 0.0f, 0);
-        gs_ortho(0.0f, (float)scaled_w, 0.0f, (float)scaled_h, -100.0f, 100.0f);
+        gs_ortho(0.0f, (float)sw, 0.0f, (float)sh, -100.0f, 100.0f);
         
         obs_source_video_render(source);
-        gs_texrender_end(texrender);
+        gs_texrender_end(context->texrender);
         
-        blog(LOG_INFO, "[DualCam] obs_source_to_mat: rendered successfully");
-    } else {
-        blog(LOG_ERROR, "[DualCam] gs_texrender_begin failed");
-        gs_texrender_destroy(texrender);
-        gs_stagesurface_destroy(stage);
-        return Mat();
+        gs_texture_t *tex = gs_texrender_get_texture(context->texrender);
+        if (tex) {
+            gs_stage_texture(context->stage, tex);
+            
+            uint8_t *data;
+            uint32_t linesize;
+            if (gs_stagesurface_map(context->stage, &data, &linesize)) {
+                // Create a temporary wrapper, then CLONE it to result 
+                // so the data persists after unmap
+                Mat frame(sh, sw, CV_8UC4, data, linesize);
+                cvtColor(frame, result, COLOR_BGRA2BGR);
+                gs_stagesurface_unmap(context->stage);
+            }
+        }
     }
-    
-    gs_texture_t *tex = gs_texrender_get_texture(texrender);
-    if (!tex) {
-        blog(LOG_ERROR, "[DualCam] Failed to get texture from texrender");
-        gs_texrender_destroy(texrender);
-        gs_stagesurface_destroy(stage);
-        return Mat();
-    }
-    
-    gs_stage_texture(stage, tex);
-    
-    uint8_t *stage_data;
-    uint32_t stage_linesize;
-    Mat result;
-
-    if (gs_stagesurface_map(stage, &stage_data, &stage_linesize)) {
-        blog(LOG_INFO, "[DualCam] obs_source_to_mat: mapped stage surface");
-        Mat frame(scaled_h, scaled_w, CV_8UC4, stage_data, stage_linesize);
-        cvtColor(frame, result, COLOR_BGRA2BGR);
-        gs_stagesurface_unmap(stage);
-        blog(LOG_INFO, "[DualCam] obs_source_to_mat: converted to BGR, size %dx%d", result.cols, result.rows);
-    } else {
-        blog(LOG_ERROR, "[DualCam] Failed to map stage surface");
-    }
-    
-    gs_stagesurface_destroy(stage);
-    gs_texrender_destroy(texrender);
-    return result;
+    return result; // Returns a BGR Mat with its own allocated memory
 }
 
 
@@ -190,19 +167,18 @@ static void *face_detection_thread(void *data)
     
 	while (!context->stop_thread) {
 		Mat local_1, local_2;
-		bool process = false;
+		bool has_work = false;
 
 		pthread_mutex_lock(&context->frame_mutex);
 		if (context->frames_ready) {
-			// Move the frames out of the context into local variables
 			local_1 = std::move(context->cam1_frame_next);
 			local_2 = std::move(context->cam2_frame_next);
 			context->frames_ready = false;
-			process = true;
+			has_work = true;
 		}
 		pthread_mutex_unlock(&context->frame_mutex);
 
-		if (process) {
+		if (has_work) {
 			pthread_mutex_lock(&context->state_mutex);
 			process_camera_mat(local_1, context->eye_cascade, &context->cam1state);
 			process_camera_mat(local_2, context->eye_cascade, &context->cam2state);
@@ -595,21 +571,16 @@ static void dualcam_video_render(void *data, gs_effect_t *effect)
 	if (!context->manual_mode) {
 		static int frame_count = 0;
 		if (++frame_count % 10 == 0) {
-			pthread_mutex_lock(&context->frame_mutex);
-			
-			// Skip if detection thread is still processing
-			if (!context->frames_ready) {
-				// 1. Create local mats first (so we don't hold the lock during slow GPU-to-CPU copies)
-				Mat m1 = obs_source_to_mat(context->camera1);
-				Mat m2 = obs_source_to_mat(context->camera2);
+			// Capture frames locally first to keep the lock duration short
+			Mat m1 = obs_source_to_mat(context, context->camera1);
+			Mat m2 = obs_source_to_mat(context, context->camera2);
 
-				// 2. Lock only to move them into the context
-				pthread_mutex_lock(&context->frame_mutex);
+			pthread_mutex_lock(&context->frame_mutex);
+			if (!context->frames_ready) {
 				context->cam1_frame_next = std::move(m1);
 				context->cam2_frame_next = std::move(m2);
 				context->frames_ready = true;
-				pthread_mutex_unlock(&context->frame_mutex);
-			}			
+			}
 			pthread_mutex_unlock(&context->frame_mutex);
 		}
 	}
