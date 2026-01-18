@@ -5,6 +5,11 @@
 OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE("obs-dualcam-switcher", "en-US")
 
+struct camstate {
+	float eye_dist_from_center;
+	bool has_eyes;
+}
+
 // Plugin data structure
 struct dualcam_switcher {
 	obs_source_t *context;           // Our source
@@ -21,6 +26,13 @@ struct dualcam_switcher {
 	pthread_t detection_thread;
 	bool thread_running;
 	volatile bool stop_thread;
+
+	struct camstate cam1state;
+	struct camstate cam2state;
+
+	float switch_timer; // threshold
+	int pending_camera; // cam that wants to be active
+	float hysteresis_thresh;
 	
 	uint32_t width;
 	uint32_t height;
