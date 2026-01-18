@@ -188,34 +188,28 @@ static void *face_detection_thread(void *data)
     struct dualcam_switcher *context = (struct dualcam_switcher *)data;
     blog(LOG_INFO, "[DualCam] Detection thread started");
     
-    while (!context->stop_thread) {
-        pthread_mutex_lock(&context->frame_mutex);
-        
-        if (context->frames_ready) {
-            blog(LOG_INFO, "[DualCam] Processing buffered frames...");
-            
-            // SWAP the buffers - now "current" has the new frames
-            // and "next" has the old frames (which we don't care about)
-            std::swap(context->cam1_frame_current, context->cam1_frame_next);
-            std::swap(context->cam2_frame_current, context->cam2_frame_next);
-            context->frames_ready = false;
-            
-            pthread_mutex_unlock(&context->frame_mutex);
-            
-            // Process outside the lock - we own "current" buffers now
-            pthread_mutex_lock(&context->state_mutex);
-            process_camera_mat(context->cam1_frame_current, context->eye_cascade, &context->cam1state);
-            process_camera_mat(context->cam2_frame_current, context->eye_cascade, &context->cam2state);
-            pthread_mutex_unlock(&context->state_mutex);
-            
-            blog(LOG_INFO, "[DualCam] Cam1 has_eyes=%d, Cam2 has_eyes=%d", 
-                 context->cam1state.has_eyes, context->cam2state.has_eyes);
-        } else {
-            pthread_mutex_unlock(&context->frame_mutex);
-        }
-        
-        os_sleep_ms(100);
-    }
+	while (!context->stop_thread) {
+		Mat local_1, local_2;
+		bool process = false;
+
+		pthread_mutex_lock(&context->frame_mutex);
+		if (context->frames_ready) {
+			// Move the frames out of the context into local variables
+			local_1 = std::move(context->cam1_frame_next);
+			local_2 = std::move(context->cam2_frame_next);
+			context->frames_ready = false;
+			process = true;
+		}
+		pthread_mutex_unlock(&context->frame_mutex);
+
+		if (process) {
+			pthread_mutex_lock(&context->state_mutex);
+			process_camera_mat(local_1, context->eye_cascade, &context->cam1state);
+			process_camera_mat(local_2, context->eye_cascade, &context->cam2state);
+			pthread_mutex_unlock(&context->state_mutex);
+		}
+		os_sleep_ms(100);
+	}
     
     blog(LOG_INFO, "[DualCam] Detection thread stopped");
     return NULL;
@@ -605,18 +599,17 @@ static void dualcam_video_render(void *data, gs_effect_t *effect)
 			
 			// Skip if detection thread is still processing
 			if (!context->frames_ready) {
-				// Write directly to "next" buffers (no clone needed!)
-				context->cam1_frame_next = obs_source_to_mat(context->camera1);
-				context->cam2_frame_next = obs_source_to_mat(context->camera2);
-				
-				if (!context->cam1_frame_next.empty() || !context->cam2_frame_next.empty()) {
-					context->frames_ready = true;
-					blog(LOG_INFO, "[DualCam] Frames captured: cam1=%dx%d cam2=%dx%d", 
-						 context->cam1_frame_next.cols, context->cam1_frame_next.rows,
-						 context->cam2_frame_next.cols, context->cam2_frame_next.rows);
-				}
-			}
-			
+				// 1. Create local mats first (so we don't hold the lock during slow GPU-to-CPU copies)
+				Mat m1 = obs_source_to_mat(context->camera1);
+				Mat m2 = obs_source_to_mat(context->camera2);
+
+				// 2. Lock only to move them into the context
+				pthread_mutex_lock(&context->frame_mutex);
+				context->cam1_frame_next = std::move(m1);
+				context->cam2_frame_next = std::move(m2);
+				context->frames_ready = true;
+				pthread_mutex_unlock(&context->frame_mutex);
+			}			
 			pthread_mutex_unlock(&context->frame_mutex);
 		}
 	}
